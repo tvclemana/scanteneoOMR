@@ -2,383 +2,477 @@ import argparse, glob, os, sys, csv, json, random
 import numpy as np
 import cv2 as cv
 
-# ===================== TEMPLATE (matches the A4 sheet I gave you) =====================
-DESIGN_W, DESIGN_H = 2480, 3508
-MARGIN = 140
-QUESTIONS_TOTAL = 30
-OPTIONS = ['A','B','C','D','E']
-PER_COL = QUESTIONS_TOTAL // 2
-COLS = 2
-COL_X = [MARGIN + 120, DESIGN_W//2 + 60]  # starting x for each column (before number width)
-START_Y = MARGIN + 160 + 140  # below header
-ROW_H = 90
-BUBBLE_R = 22
-GAP_OPT = 70
-NUM_W = 60
+# ===================== TEMPLATE GENERATION =====================
+def create_answer_sheet_template(width=2480, height=3508, questions=30, options=5):
+    """
+    Create a blank OMR answer sheet template.
+    Returns the template image and bubble positions.
+    """
+    # Create white background
+    template = np.ones((height, width, 3), dtype=np.uint8) * 255
+    
+    # Template parameters
+    margin = 140
+    question_start_y = margin + 200
+    row_height = 90
+    bubble_radius = 22
+    gap_between_options = 70
+    question_number_width = 60
+    cols = 2
+    questions_per_col = questions // cols
+    
+    # Colors
+    black = (0, 0, 0)
+    gray = (128, 128, 128)
+    
+    bubble_positions = {}
+    
+    # Draw title
+    cv.putText(template, "OMR ANSWER SHEET", (width//2 - 200, margin), 
+               cv.FONT_HERSHEY_SIMPLEX, 1.5, black, 3)
+    
+    # Draw instructions
+    cv.putText(template, "Fill in the circle completely for your answer", (width//2 - 300, margin + 80), 
+               cv.FONT_HERSHEY_SIMPLEX, 0.8, gray, 2)
+    
+    # Draw questions and bubbles
+    for col in range(cols):
+        col_x = margin + 120 + col * (width//2 - 60)
+        
+        for row in range(questions_per_col):
+            question_num = col * questions_per_col + row + 1
+            y = question_start_y + row * row_height
+            
+            # Draw question number
+            cv.putText(template, str(question_num), (col_x, y + 8), 
+                      cv.FONT_HERSHEY_SIMPLEX, 0.6, black, 2)
+            
+            # Draw option letters and bubbles
+            if question_num not in bubble_positions:
+                bubble_positions[question_num] = {}
+            
+            for opt_idx, option in enumerate(['A', 'B', 'C', 'D', 'E']):
+                x = col_x + question_number_width + opt_idx * gap_between_options
+                
+                # Draw option letter
+                cv.putText(template, option, (x - 8, y + 8), 
+                          cv.FONT_HERSHEY_SIMPLEX, 0.5, gray, 1)
+                
+                # Draw bubble (empty circle)
+                cv.circle(template, (x, y), bubble_radius, black, 2)
+                
+                # Store bubble position
+                bubble_positions[question_num][option] = (x, y, bubble_radius)
+    
+    return template, bubble_positions
 
-def template_layout():
-    """Return [(q, opt, cx, cy, r), ...] in DESIGN coordinates."""
+def create_filled_answer_sheet(template, bubble_positions, answers):
+    """
+    Create a filled answer sheet based on the provided answers.
+    answers: dict mapping question number to option (A, B, C, D, E)
+    """
+    filled_sheet = template.copy()
+    
+    # Fill in the bubbles based on answers
+    for question_num, answer in answers.items():
+        if question_num in bubble_positions and answer in bubble_positions[question_num]:
+            x, y, r = bubble_positions[question_num][answer]
+            # Fill the circle completely
+            cv.circle(filled_sheet, (x, y), r, (0, 0, 0), -1)
+    
+    return filled_sheet
+
+# ===================== TEMPLATE-BASED DETECTION =====================
+def detect_template_structure(image):
+    """
+    Detect the template structure (question numbers, option letters) to guide bubble detection.
+    Returns the detected template parameters.
+    """
+    # Convert to grayscale
+    if len(image.shape) == 3:
+        gray = cv.cvtColor(image, cv.COLOR_BGR2GRAY)
+    else:
+        gray = image
+    
+    h, w = gray.shape
+    
+    # Estimate template parameters based on image dimensions
+    estimated_margin = int(min(w, h) * 0.05)  # 5% of smaller dimension
+    estimated_row_height = int(h * 0.025)  # 2.5% of height
+    estimated_bubble_radius = int(min(w, h) * 0.01)  # 1% of smaller dimension
+    
+    # Use morphological operations to find text-like regions
+    kernel = cv.getStructuringElement(cv.MORPH_RECT, (3, 3))
+    dilated = cv.dilate(gray, kernel, iterations=1)
+    eroded = cv.erode(dilated, kernel, iterations=1)
+    
+    # Find contours that might be text
+    contours, _ = cv.findContours(eroded, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+    
+    # Filter contours by size to find text regions
+    text_regions = []
+    for contour in contours:
+        x, y, w_contour, h_contour = cv.boundingRect(contour)
+        area = w_contour * h_contour
+        
+        # Text regions are typically small rectangles
+        if 50 < area < 500 and 5 < w_contour < 50 and 5 < h_contour < 50:
+            text_regions.append((x, y, w_contour, h_contour))
+    
+    # Sort text regions by y-coordinate to identify rows
+    if text_regions:
+        text_regions.sort(key=lambda r: r[1])
+        
+        # Group into rows
+        rows = []
+        current_row = [text_regions[0]]
+        row_tolerance = estimated_row_height // 2
+        
+        for region in text_regions[1:]:
+            if abs(region[1] - current_row[0][1]) <= row_tolerance:
+                current_row.append(region)
+            else:
+                # Sort current row by x-coordinate
+                current_row.sort(key=lambda r: r[0])
+                rows.append(current_row)
+                current_row = [region]
+        
+        if current_row:
+            current_row.sort(key=lambda r: r[0])
+            rows.append(current_row)
+    else:
+        rows = []
+    
+    # Estimate template parameters
+    template_params = {
+        'margin': estimated_margin,
+        'row_height': estimated_row_height,
+        'bubble_radius': estimated_bubble_radius,
+        'text_regions': text_regions,
+        'rows': rows,
+        'image_width': w,
+        'image_height': h
+    }
+    
+    return template_params
+
+def detect_bubbles_with_template(image, template_params):
+    """
+    Detect bubbles using the template structure as a guide.
+    """
+    if len(image.shape) == 3:
+        gray = cv.cvtColor(image, cv.COLOR_BGR2GRAY)
+    else:
+        gray = image
+    
+    h, w = gray.shape
+    
+    # Use template parameters to predict bubble locations
+    margin = template_params['margin']
+    row_height = template_params['row_height']
+    bubble_radius = template_params['bubble_radius']
+    
+    # Predict bubble positions based on template structure
+    predicted_bubbles = []
+    
+    # Estimate question layout (2 columns, 15 questions per column)
+    questions_per_col = 15
+    col_width = w // 2
+    
+    for col in range(2):
+        col_x = margin + 120 + col * col_width
+        
+        for row in range(questions_per_col):
+            y = margin + 200 + row * row_height
+            
+            # Predict 5 options per question
+            for opt_idx in range(5):
+                x = col_x + 60 + opt_idx * 70  # 60 for question number, 70 between options
+                
+                # Check if this region actually contains a bubble
+                # Look for circular patterns in the predicted location
+                roi_x1 = max(0, x - bubble_radius - 5)
+                roi_y1 = max(0, y - bubble_radius - 5)
+                roi_x2 = min(w, x + bubble_radius + 5)
+                roi_y2 = min(h, y + bubble_radius + 5)
+                
+                roi = gray[roi_y1:roi_y2, roi_x1:roi_x2]
+                
+                if roi.size > 0:
+                    # Use Hough Circle Transform to detect actual circles
+                    try:
+                        circles = cv.HoughCircles(
+                            roi,
+                            cv.HOUGH_GRADIENT,
+                            dp=1,
+                            minDist=bubble_radius * 2,
+                            param1=50,
+                            param2=30,
+                            minRadius=bubble_radius - 5,
+                            maxRadius=bubble_radius + 5
+                        )
+                        
+                        if circles is not None:
+                            # Found a circle, add to detected bubbles
+                            for circle in circles[0]:
+                                cx, cy, r = circle
+                                # Convert back to full image coordinates
+                                full_x = int(roi_x1 + cx)
+                                full_y = int(roi_y1 + cy)
+                                predicted_bubbles.append((full_x, full_y, int(r)))
+                    except Exception as e:
+                        # Skip this region if there's an error
+                        continue
+    
+    return predicted_bubbles
+
+def organize_bubbles_into_questions(bubbles, template_params):
+    """
+    Organize detected bubbles into question-option structure.
+    """
+    if not bubbles:
+        return {}
+    
+    # Sort bubbles by y-coordinate to group by rows
+    bubbles.sort(key=lambda b: b[1])
+    
+    # Group bubbles by rows
+    row_tolerance = template_params['row_height'] // 2
     rows = []
-    for c in range(COLS):
-        for r in range(PER_COL):
-            qnum = c*PER_COL + r + 1
-            y = START_Y + r*ROW_H
-            x = COL_X[c] + NUM_W
-            for i, opt in enumerate(OPTIONS):
-                cx = x + i*GAP_OPT
-                cy = y
-                rows.append((qnum, opt, cx, cy, BUBBLE_R))
-    return rows
-
-TEMPLATE_ENTRIES = template_layout()
-
-# ===================== IMAGE UTILS =====================
-def read_bgr(path: str) -> np.ndarray:
-    img = cv.imread(path, cv.IMREAD_COLOR)
-    if img is None:
-        raise ValueError(f"Could not read image: {path}")
-    return img
-
-def save_image(path: str, img: np.ndarray):
-    if not cv.imwrite(path, img):
-        raise ValueError(f"Failed to write: {path}")
-
-def resize_max(img: np.ndarray, max_side: int = 1600):
-    h, w = img.shape[:2]
-    if max(h, w) <= max_side:
-        return img, 1.0
-    s = max_side / max(h, w)
-    return cv.resize(img, (int(w*s), int(h*s)), interpolation=cv.INTER_AREA), s
-
-def canny_edges(gray: np.ndarray):
-    blur = cv.GaussianBlur(gray, (5,5), 0)
-    v = np.median(blur)
-    lo = int(max(0, 0.66*v))
-    hi = int(min(255, 1.33*v))
-    edges = cv.Canny(blur, lo, hi)
-    edges = cv.dilate(edges, np.ones((3,3), np.uint8), 1)
-    edges = cv.morphologyEx(edges, cv.MORPH_CLOSE, np.ones((5,5), np.uint8), 1)
-    return edges
-
-def line_angle(x1,y1,x2,y2):
-    ang = abs(np.degrees(np.arctan2(y2-y1, x2-x1)))
-    return ang if ang >= 0 else ang + 180
-
-def average_line(lines):
-    pts = np.array(lines, dtype=np.float32)
-    return tuple(np.mean(pts, axis=0).tolist())
-
-def intersect(p1, p2):
-    x1,y1,x2,y2 = p1
-    x3,y3,x4,y4 = p2
-    A1, B1, C1 = y2-y1, x1-x2, (y2-y1)*x1 + (x1-x2)*y1
-    A2, B2, C2 = y4-y3, x3-x4, (y4-y3)*x3 + (x3-x4)*y3
-    det = A1*B2 - A2*B1
-    if abs(det) < 1e-6: return None
-    x = (B2*C1 - B1*C2)/det
-    y = (A1*C2 - A2*C1)/det
-    return (x, y)
-
-def order_quad(pts: np.ndarray):
-    s = pts.sum(axis=1)
-    d = np.diff(pts, axis=1).flatten()
-    tl = pts[np.argmin(s)]; br = pts[np.argmax(s)]
-    tr = pts[np.argmin(d)]; bl = pts[np.argmax(d)]
-    return np.array([tl, tr, br, bl], dtype=np.float32)
-
-def warp(img: np.ndarray, quad: np.ndarray, border=2, fixed=True):
-    """
-    If fixed=True, warp the detected page to the exact template canvas
-    (2480x3508). This removes scale/aspect drift so annotations align.
-    """
-    if fixed:
-        W, H = DESIGN_W, DESIGN_H
-        dst = np.array([[0,0],[W-1,0],[W-1,H-1],[0,H-1]], dtype=np.float32)
-    else:
-        tl, tr, br, bl = quad
-        wA = np.linalg.norm(br - bl); wB = np.linalg.norm(tr - tl)
-        hA = np.linalg.norm(tr - br); hB = np.linalg.norm(tl - bl)
-        W = max(int(max(wA, wB)), 100); H = max(int(max(hA, hB)), 100)
-        dst = np.array([[0,0],[W-1,0],[W-1,H-1],[0,H-1]], dtype=np.float32)
-
-    M = cv.getPerspectiveTransform(quad.astype(np.float32), dst)
-    warped = cv.warpPerspective(img, M, (W, H), flags=cv.INTER_CUBIC, borderMode=cv.BORDER_REPLICATE)
-    return cv.copyMakeBorder(warped, border, border, border, border, cv.BORDER_CONSTANT, value=(255,255,255))
-
-def hough_quad(edges: np.ndarray):
-    lines = cv.HoughLinesP(edges, 1, np.pi/180, threshold=120,
-                           minLineLength=int(edges.shape[1]*0.4), maxLineGap=20)
-    if lines is None: return None
-    horiz, vert = [], []
-    for l in lines[:,0]:
-        x1,y1,x2,y2 = map(int,l)
-        ang = line_angle(x1,y1,x2,y2)
-        if (ang < 15) or (ang > 165): horiz.append((x1,y1,x2,y2))
-        elif 75 <= ang <= 105:       vert.append((x1,y1,x2,y2))
-    if not horiz or not vert: return None
-    ymid = lambda L: (L[1]+L[3])/2
-    xmid = lambda L: (L[0]+L[2])/2
-    top    = min(horiz, key=ymid)
-    bottom = max(horiz, key=ymid)
-    left   = min(vert,  key=xmid)
-    right  = max(vert,  key=xmid)
-    t = average_line([top]); b = average_line([bottom])
-    l = average_line([left]); r = average_line([right])
-    tl = intersect(t, l); tr = intersect(t, r)
-    br = intersect(b, r); bl = intersect(b, l)
-    if None in (tl,tr,br,bl): return None
-    quad = np.array([tl,tr,br,bl], dtype=np.float32)
-    if np.any(~np.isfinite(quad)): return None
-    return order_quad(quad)
-
-def contour_quad(edges: np.ndarray):
-    cnts, _ = cv.findContours(edges, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
-    if not cnts: return None
-    for c in sorted(cnts, key=cv.contourArea, reverse=True)[:10]:
-        peri = cv.arcLength(c, True)
-        approx = cv.approxPolyDP(c, 0.02*peri, True)
-        if len(approx) == 4:
-            return order_quad(approx.reshape(4,2).astype(np.float32))
-    return None
-
-def threshold_image(gray: np.ndarray, method: str):
-    if method == "otsu":
-        blur = cv.GaussianBlur(gray, (5,5), 0)
-        _, th = cv.threshold(blur, 0, 255, cv.THRESH_BINARY+cv.THRESH_OTSU)
-    else:
-        th = cv.adaptiveThreshold(gray, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                  cv.THRESH_BINARY, 31, 10)
-    # Clean noise for fill_ratio
-    th = cv.medianBlur(th, 3)
-    return th
+    current_row = [bubbles[0]]
+    
+    for bubble in bubbles[1:]:
+        if abs(bubble[1] - current_row[0][1]) <= row_tolerance:
+            current_row.append(bubble)
+        else:
+            # Sort current row by x-coordinate
+            current_row.sort(key=lambda b: b[0])
+            rows.append(current_row)
+            current_row = [bubble]
+    
+    if current_row:
+        current_row.sort(key=lambda b: b[0])
+        rows.append(current_row)
+    
+    # Organize into question-option structure
+    bubble_positions = {}
+    question_num = 1
+    
+    for row in rows:
+        if len(row) >= 3:  # Need at least 3 options to be valid
+            # Map options A, B, C, D, E to the bubbles in this row
+            options = ['A', 'B', 'C', 'D', 'E']
+            for i, (x, y, r) in enumerate(row[:5]):  # Take first 5 bubbles
+                if question_num not in bubble_positions:
+                    bubble_positions[question_num] = {}
+                bubble_positions[question_num][options[i]] = (x, y, r)
+            question_num += 1
+    
+    return bubble_positions
 
 # ===================== SCORING =====================
-def scale_template_to(wW, wH):
-    """Return scaled positions for current warped size."""
-    sx = wW / DESIGN_W
-    sy = wH / DESIGN_H
-    scaled = []
-    for q, opt, cx, cy, r in TEMPLATE_ENTRIES:
-        scaled.append((q, opt, int(round(cx*sx)), int(round(cy*sy)), int(round(r*min(sx, sy)))))
-    return scaled
-
 def fill_ratio(binary_img, cx, cy, r):
-    """binary_img: 0..255; count dark pixels inside circle."""
+    """Calculate the fill ratio of a bubble."""
     h, w = binary_img.shape[:2]
     r = max(5, r)
+    
     x0, y0 = max(0, cx - r), max(0, cy - r)
     x1, y1 = min(w-1, cx + r), min(h-1, cy + r)
+    
     roi = binary_img[y0:y1+1, x0:x1+1]
-    if roi.size == 0: return 0.0
+    if roi.size == 0:
+        return 0.0
+    
+    # Create circular mask
     Y, X = np.ogrid[:roi.shape[0], :roi.shape[1]]
     mask = (X - (cx - x0))**2 + (Y - (cy - y0))**2 <= r*r
-    vals = roi[mask]
-    # Count "black" pixels (filled marks)
-    black = np.count_nonzero(vals < 128)
-    return black / float(mask.sum() + 1e-6)
+    
+    # Count dark pixels (filled marks)
+    dark_pixels = np.count_nonzero(roi[mask] < 128)
+    total_pixels = mask.sum()
+    
+    return dark_pixels / total_pixels if total_pixels > 0 else 0.0
 
-def decide_answer(ratios, min_fill=0.28, min_margin=0.08):
-    """ratios: dict opt->ratio. Returns (choice or None/'multi', confidence)."""
-    items = sorted(ratios.items(), key=lambda kv: kv[1], reverse=True)
-    top_opt, top_val = items[0]
-    if len(items) > 1:
-        next_val = items[1][1]
+def decide_answer(ratios, min_fill=0.3):
+    """Decide which option is selected based on fill ratios."""
+    if not ratios:
+        return None, 0.0
+    
+    # Find the option with the highest fill ratio
+    best_option = max(ratios.items(), key=lambda x: x[1])
+    
+    if best_option[1] >= min_fill:
+        return best_option[0], best_option[1]
     else:
-        next_val = 0.0
-    if top_val < min_fill:
-        return (None, top_val)
-    if (top_val - next_val) < min_margin:
-        return ('multi', top_val - next_val)
-    return (top_opt, top_val)
+        return None, best_option[1]
 
-def score_sheet(warped_bgr, th_binary, answer_key, annotate=True):
-    """Returns (per_question dict, score_count, annotated_image)."""
-    h, w = th_binary.shape[:2]
-    positions = scale_template_to(w, h)
-    per_q = {q: {"selected": None, "ratios": {}, "correct": answer_key.get(q)} for q in range(1, QUESTIONS_TOTAL+1)}
-
-    # compute ratios
-    for q, opt, cx, cy, r in positions:
-        ratio = fill_ratio(th_binary, cx, cy, r)
-        per_q[q]["ratios"][opt] = ratio
-
-    # decide per question
+def score_sheet(image, bubble_positions, answer_key):
+    """Score the OMR sheet against the answer key."""
+    # Convert to grayscale and threshold
+    if len(image.shape) == 3:
+        gray = cv.cvtColor(image, cv.COLOR_BGR2GRAY)
+    else:
+        gray = image
+    
+    # Apply threshold to get binary image
+    _, binary = cv.threshold(gray, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
+    
+    results = {}
     correct_count = 0
-    for q in range(1, QUESTIONS_TOTAL+1):
-        choice, conf = decide_answer(per_q[q]["ratios"])
-        per_q[q]["selected"] = choice
-        per_q[q]["confidence"] = float(conf)
-        per_q[q]["is_correct"] = (choice == per_q[q]["correct"])
-        if per_q[q]["is_correct"]:
+    
+    for question_num, options in bubble_positions.items():
+        if question_num not in results:
+            results[question_num] = {}
+        
+        # Calculate fill ratios for each option
+        ratios = {}
+        for option, (x, y, r) in options.items():
+            ratio = fill_ratio(binary, x, y, r)
+            ratios[option] = ratio
+        
+        # Decide the selected answer
+        selected, confidence = decide_answer(ratios)
+        
+        # Check if correct
+        correct_answer = answer_key.get(question_num)
+        is_correct = selected == correct_answer
+        
+        if is_correct:
             correct_count += 1
+        
+        results[question_num] = {
+            'selected': selected,
+            'confidence': confidence,
+            'correct': correct_answer,
+            'is_correct': is_correct,
+            'ratios': ratios
+        }
+    
+    return results, correct_count
 
-    # annotate image
-    ann = warped_bgr.copy()
-    for q, opt, cx, cy, r in positions:
-        sel = per_q[q]["selected"]
-        correct = per_q[q]["correct"]
-        color = (200, 200, 200)  # default
-        if opt == correct:
-            color = (0, 200, 0)   # green ring on correct option
-        if opt == sel and sel not in (None, 'multi'):
-            color = (0, 0, 255)   # red ring on chosen option
-        cv.circle(ann, (cx, cy), r+4, color, 2)
-    return per_q, correct_count, ann
+# ===================== MAIN FUNCTIONS =====================
+def generate_mock_sheets(output_dir="."):
+    """Generate mock answer sheets for testing."""
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Generate blank template
+    template, bubble_positions = create_answer_sheet_template()
+    template_path = os.path.join(output_dir, "omr_blank_template.png")
+    cv.imwrite(template_path, template)
+    
+    # Generate random answers
+    answers = {}
+    for q in range(1, 31):
+        answers[q] = random.choice(['A', 'B', 'C', 'D', 'E'])
+    
+    # Generate filled sheet
+    filled_sheet = create_filled_answer_sheet(template, bubble_positions, answers)
+    filled_path = os.path.join(output_dir, "omr_filled_test.png")
+    cv.imwrite(filled_path, filled_sheet)
+    
+    # Save answer key
+    answer_key_path = os.path.join(output_dir, "omr_answer_key.csv")
+    with open(answer_key_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['question', 'answer'])
+        for q in sorted(answers.keys()):
+            writer.writerow([q, answers[q]])
+    
+    # Save bubble positions for reference
+    positions_path = os.path.join(output_dir, "omr_bubble_positions.json")
+    with open(positions_path, 'w') as f:
+        json.dump(bubble_positions, f, indent=2)
+    
+    print(f"Generated mock sheets in {output_dir}:")
+    print(f"  - Blank template: {template_path}")
+    print(f"  - Filled test sheet: {filled_path}")
+    print(f"  - Answer key: {answer_key_path}")
+    print(f"  - Bubble positions: {positions_path}")
+    
+    return template_path, filled_path, answer_key_path, positions_path
 
-# ===================== CORE PIPELINE =====================
-def process_one(path: str, method: str, debug: bool, max_side: int, seed: int | None):
-    if seed is not None:
-        random.seed(seed)
-
-    # 1) Build a random answer key (A–E) per question
-    answer_key = {q: random.choice(OPTIONS) for q in range(1, QUESTIONS_TOTAL+1)}
-
-    # 2) Read + warp + thresh (same as before)
-    bgr0 = read_bgr(path)
-    bgr, _ = resize_max(bgr0, max_side)
-    gray = cv.cvtColor(bgr, cv.COLOR_BGR2GRAY)
-    edges = canny_edges(gray)
-
-    quad = hough_quad(edges)
-    if quad is None:
-        quad = contour_quad(edges)
-
-    if quad is not None:
-        warped = warp(bgr, quad)
-        g = cv.cvtColor(warped, cv.COLOR_BGR2GRAY)
-        th = threshold_image(g, method)
+def process_omr_sheet(image_path, answer_key_path=None):
+    """Process an OMR sheet and return results."""
+    # Read image
+    image = cv.imread(image_path)
+    if image is None:
+        raise ValueError(f"Could not read image: {image_path}")
+    
+    # Detect template structure
+    print("Detecting template structure...")
+    template_params = detect_template_structure(image)
+    
+    # Detect bubbles using template guidance
+    print("Detecting bubbles...")
+    detected_bubbles = detect_bubbles_with_template(image, template_params)
+    print(f"Detected {len(detected_bubbles)} bubbles")
+    
+    # Organize bubbles into questions
+    print("Organizing bubbles into questions...")
+    bubble_positions = organize_bubbles_into_questions(detected_bubbles, template_params)
+    print(f"Organized into {len(bubble_positions)} questions")
+    
+    # Load answer key if provided
+    answer_key = {}
+    if answer_key_path and os.path.exists(answer_key_path):
+        with open(answer_key_path, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                answer_key[int(row['question'])] = row['answer']
+    
+    # Score the sheet
+    if answer_key:
+        print("Scoring sheet...")
+        results, correct_count = score_sheet(image, bubble_positions, answer_key)
+        
+        # Calculate score
+        total_questions = len(bubble_positions)
+        score_percentage = (correct_count / total_questions * 100) if total_questions > 0 else 0
+        
+        print(f"Score: {correct_count}/{total_questions} ({score_percentage:.1f}%)")
+        
+        return {
+            'bubble_positions': bubble_positions,
+            'results': results,
+            'score': correct_count,
+            'total': total_questions,
+            'percentage': score_percentage
+        }
     else:
-        warped = bgr
-        th = threshold_image(gray, method)
-
-    # 3) Score against the random key
-    per_q, correct_count, ann = score_sheet(warped, th, answer_key)
-
-    # 4) Save outputs
-    base, _ = os.path.splitext(path)
-    out_bin = f"{base}.warped_{method}.png"
-    out_ann = f"{base}.annotated_{method}.jpg"
-    out_csv = f"{base}.score_{method}.csv"
-    out_key = f"{base}.answer_key_{method}.csv"
-    out_sum = f"{base}.summary_{method}.json"
-
-    # Ensure 3-channel for saving bin
-    bin3 = cv.cvtColor(th, cv.COLOR_GRAY2BGR)
-    save_image(out_bin, bin3)
-    save_image(out_ann, ann)
-
-    # per-question CSV
-    with open(out_csv, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["question", "selected", "correct", "is_correct", "confidence"] + [f"ratio_{o}" for o in OPTIONS])
-        for q in range(1, QUESTIONS_TOTAL+1):
-            row = per_q[q]
-            ratios = [f"{row['ratios'].get(o,0):.3f}" for o in OPTIONS]
-            w.writerow([q, row["selected"], row["correct"], int(row["is_correct"]), f"{row['confidence']:.3f}"] + ratios)
-
-    # answer key CSV
-    with open(out_key, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["question", "correct"])
-        for q in range(1, QUESTIONS_TOTAL+1):
-            w.writerow([q, answer_key[q]])
-
-    # JSON summary
-    summary = {
-        "file": os.path.basename(path),
-        "method": method,
-        "total_questions": QUESTIONS_TOTAL,
-        "score": correct_count,
-        "percent": round(100.0 * correct_count / QUESTIONS_TOTAL, 2),
-    }
-    with open(out_sum, "w") as f:
-        json.dump(summary, f, indent=2)
-
-    # Optional debug collage
-    if debug:
-        dbg_items = [bgr]
-        dbg_edges = cv.cvtColor(edges, cv.COLOR_GRAY2BGR)
-        dbg_items.append(dbg_edges)
-        if quad is not None:
-            dbg_poly = bgr.copy()
-            cv.polylines(dbg_poly, [quad.astype(int)], True, (0,255,0), 2)
-            dbg_items.append(dbg_poly)
-        dbg_items.append(warped)
-        dbg_items.append(bin3)
-        dbg = hstack_same_height(dbg_items)
-        save_image(f"{base}.debug_{method}.jpg", dbg)
-
-    return summary
-
-def hstack_same_height(images):
-    h = min(im.shape[0] for im in images)
-    row = []
-    for im in images:
-        if im.ndim == 2:
-            im = cv.cvtColor(im, cv.COLOR_GRAY2BGR)
-        scale = h / im.shape[0]
-        row.append(cv.resize(im, (int(im.shape[1]*scale), h), interpolation=cv.INTER_AREA))
-    return np.hstack(row)
-
-# ===================== GENERATE ANSWERED SHEET =====================
-def gen_answered_sheet(blank_path: str, out_path: str, seed: int | None):
-    """Take the blank A4 template PNG and draw random filled bubbles."""
-    if seed is not None:
-        random.seed(seed)
-    bgr = read_bgr(blank_path)
-    if bgr.shape[1] != DESIGN_W or bgr.shape[0] != DESIGN_H:
-        print("Warning: expected the provided blank to be the A4 template (2480x3508). Proceeding anyway.", file=sys.stderr)
-    answers = {q: random.choice(OPTIONS) for q in range(1, QUESTIONS_TOTAL+1)}
-    for q, opt, cx, cy, r in TEMPLATE_ENTRIES:
-        if answers[q] == opt:
-            cv.circle(bgr, (cx, cy), max(6, r-3), (0,0,0), thickness=-1)
-    save_image(out_path, bgr)
-    # also dump the chosen answers for reference
-    with open(os.path.splitext(out_path)[0] + "_answers.csv", "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["question", "answer"])
-        for q in range(1, QUESTIONS_TOTAL+1):
-            w.writerow([q, answers[q]])
-    return out_path
+        return {
+            'bubble_positions': bubble_positions,
+            'message': 'No answer key provided for scoring'
+        }
 
 # ===================== CLI =====================
 def main():
-    ap = argparse.ArgumentParser(description="OMR: warp (Hough) + threshold + scoring")
-    sub = ap.add_subparsers(dest="cmd")
-
-    p_proc = sub.add_parser("process", help="Process and score local images")
-    p_proc.add_argument("inputs", help="Image path or glob (e.g., ./scans/*.jpg)")
-    p_proc.add_argument("--method", choices=["adaptive","otsu"], default="adaptive")
-    p_proc.add_argument("--debug", action="store_true")
-    p_proc.add_argument("--max-side", type=int, default=1600)
-    p_proc.add_argument("--seed", type=int, default=1234, help="Seed for random answer key")
-
-    p_gen = sub.add_parser("gen-answersheet", help="Generate a randomly answered sheet from the blank A4 template")
-    p_gen.add_argument("blank_png", help="Path to OMR_Sample_A4.png")
-    p_gen.add_argument("--out", required=True, help="Output path for the filled sheet")
-    p_gen.add_argument("--seed", type=int, default=5678)
-
-    args = ap.parse_args()
-
-    if args.cmd == "gen-answersheet":
-        outp = gen_answered_sheet(args.blank_png, args.out, args.seed)
-        print(f"Generated answered sheet -> {outp}")
-        return
-
-    if args.cmd == "process":
-        paths = glob.glob(args.inputs) or ([args.inputs] if os.path.isfile(args.inputs) else [])
-        if not paths:
-            print(f"No files matched: {args.inputs}", file=sys.stderr)
+    parser = argparse.ArgumentParser(description="OMR Sheet Generator and Processor")
+    subparsers = parser.add_subparsers(dest='command', help='Available commands')
+    
+    # Generate command
+    gen_parser = subparsers.add_parser('generate', help='Generate mock OMR sheets')
+    gen_parser.add_argument('--output-dir', default='.', help='Output directory for generated sheets')
+    
+    # Process command
+    process_parser = subparsers.add_parser('process', help='Process an OMR sheet')
+    process_parser.add_argument('image_path', help='Path to the OMR sheet image')
+    process_parser.add_argument('--answer-key', help='Path to the answer key CSV file')
+    
+    args = parser.parse_args()
+    
+    if args.command == 'generate':
+        generate_mock_sheets(args.output_dir)
+    elif args.command == 'process':
+        try:
+            results = process_omr_sheet(args.image_path, args.answer_key)
+            print("\nProcessing Results:")
+            print(json.dumps(results, indent=2))
+        except Exception as e:
+            print(f"Error processing sheet: {e}", file=sys.stderr)
             sys.exit(1)
-        for p in paths:
-            try:
-                summary = process_one(p, args.method, args.debug, args.max_side, args.seed)
-                print(f"✓ {os.path.basename(p)} -> score {summary['score']}/{summary['total_questions']} ({summary['percent']}%)")
-            except Exception as e:
-                print(f"✗ {os.path.basename(p)} failed: {e}", file=sys.stderr)
-        return
-
-    ap.print_help()
+    else:
+        parser.print_help()
 
 if __name__ == "__main__":
     main()
